@@ -1,0 +1,389 @@
+---
+- hosts: all
+  become: true
+  gather_facts: yes
+
+  vars:
+    log_file: "/var/log/lv_create.log"
+
+  # Auto-generate LV name from mount point
+    lv_name: "{{ 'lv_' + (mount_point | regex_replace('^/', '') | replace(..."
+
+  tasks:
+
+    - name: Initialize status variables
+      set_fact:
+        operation_status: "SUCCESS"
+        failed_task: "None"
+        failure_reason: "None"
+
+    - block:
+
+    ############################################################
+    # VALIDATE MOUNTPOINT AND EXISTING LV
+    ############################################################
+
+        - name: Get target mountpoint information
+          set_fact:
+            mount_info: "{{ ansible_mounts | selectattr('mount', 'equalto', mount_point) | list }}"
+
+        - name: Check whether LV is already mounted
+          set_fact:
+            lv_existing_mount: >-
+              {{
+                ansible_mounts
+                | selectattr('device', 'equalto',
+                  '/dev/mapper/' ~ vg_name ~ '--' ~ lv_name)
+                | list
+              }}
+
+        - name: Fail if mountpoint is used by another device
+          fail:
+            msg: >-
+              Mountpoint {{ mount_point }}
+              already used by {{ mount_info[0].device }}
+          when:
+            - mount_info | length > 0
+            - mount_info[0].device != ('/dev/mapper/' ~ vg_name ~ '--' ~ lv_name)
+
+        - name: Fail if LV already mounted elsewhere
+          fail:
+            msg: >-
+              LV {{ lv_name }}
+              already mounted on
+              {{ lv_existing_mount[0].mount }}
+
+          when:
+            - lv_existing_mount | length > 0
+            - lv_existing_mount[0].mount != mount_point
+
+############################################################
+# LOG START
+############################################################
+
+        - name: Log start
+          lineinfile:
+            path: "{{ log_file }}"
+            create: yes
+            line: "Started at {{ ansible_date_time.iso8601 }}"
+
+############################################################
+# VG CHECK
+############################################################
+
+        - name: Check if VG exists
+          command: vgdisplay {{ vg_name }}
+          register: vg_check
+          ignore_errors: true
+          changed_when: false
+
+        - name: Get VG free space
+          command: vgs --noheadings -o vg_free --units g --nosuffix {{ vg_name }}
+          register: vg_free
+          changed_when: false
+          when: vg_check.rc == 0
+
+############################################################
+# FIND UNUSED DISK
+############################################################
+
+        - name: Detect unused disk
+          shell: |
+            for d in $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
+                pvs /dev/$d >/dev/null 2>&1 && continue
+
+                if [ "$(lsblk /dev/$d -nl | wc -l)" -eq 1 ]; then
+                    echo /dev/$d
+                    break
+                fi
+            done
+          register: free_disk
+          changed_when: false
+
+############################################################
+# CREATE VG IF MISSING
+############################################################
+
+        - name: Fail when VG missing and no free disk available
+          fail:
+            msg: "No unused disk found for VG creation"
+          when:
+            - vg_check.rc != 0
+            - free_disk.stdout | trim == ""
+
+        - name: Create PV
+          command: pvcreate {{ free_disk.stdout }}
+          when: vg_check.rc != 0
+
+        - name: Create VG
+          command: vgcreate {{ vg_name }} {{ free_disk.stdout }}
+          when: vg_check.rc != 0
+
+############################################################
+# EXTEND VG IF REQUIRED
+############################################################
+
+        - name: Fail if VG lacks space and no disk available
+          fail:
+            msg: "No free disk available for VG extension"
+          when:
+            - vg_check.rc == 0
+            - (vg_free.stdout | trim | float) <
+              (vg_size | regex_replace('G','') | float)
+            - free_disk.stdout | trim == ""
+
+        - name: Extend VG with new disk
+          block:
+            - name: Create PV for VG extension
+              command: pvcreate {{ free_disk.stdout }}
+
+            - name: Extend VG
+              command: vgextend {{ vg_name }} {{ free_disk.stdout }}
+
+          when:
+            - vg_check.rc == 0
+            - (vg_free.stdout | trim | float) <
+              (vg_size | regex_replace('G','') | float)
+            - free_disk.stdout | trim != ""
+
+############################################################
+# LV CHECK
+############################################################
+
+        - name: Check if LV exists
+          command: lvdisplay /dev/{{ vg_name }}/{{ lv_name }}
+          register: lv_check
+          ignore_errors: true
+          changed_when: false
+
+        - name: Create LV
+          command: lvcreate -y -L {{ lv_size }} -n {{ lv_name }} {{ vg_name }}
+          when: lv_check.rc != 0
+############################################################
+# LV EXTENSION
+############################################################
+
+        - name: Get existing LV size
+          command: lvs --noheadings -o lv_size --units g --nosuffix {{ vg_name }}/{{ lv_name }}
+          register: current_lv_size
+          changed_when: false
+          when: lv_check.rc == 0
+
+############################################################
+# PREVENT LV REDUCTION
+############################################################
+
+        - name: Fail if requested size is smaller than existing LV
+          fail:
+            msg: >-
+              Filesystem should not reduce.
+              Existing LV size is
+              {{ current_lv_size.stdout | trim }}G.
+              Requested size is
+              {{ lv_size }}.
+              Only extension is supported.
+          when:
+            - lv_check.rc == 0
+            - (current_lv_size.stdout | trim | float)
+              > (lv_size | regex_replace('G','') | float)
+
+        - name: Extend LV
+          command: lvresize -y -L {{ lv_size }} /dev/{{ vg_name }}/{{ lv_name }}
+          register: lvresize_result
+          when:
+            - lv_check.rc == 0
+            - (current_lv_size.stdout | trim | float)
+              > (lv_size | regex_replace('G','') | float)
+
+        - name: Wait for LV device
+          wait_for:
+            path: "/dev/mapper/{{ vg_name }}--{{ lv_name }}"
+            timeout: 30
+
+############################################################
+# FILESYSTEM VALIDATION
+############################################################
+
+        - name: Get filesystem type
+          command: blkid -o value -s TYPE /dev/mapper/{{ vg_name }}--{{ lv_name }}
+          register: current_fs
+          ignore_errors: true
+          changed_when: false
+
+        - name: Stop on filesystem mismatch
+          fail:
+          msg: >-
+            Filesystem mismatch detected.
+            Existing={{ current_fs.stdout }}
+            Requested={{ fs_type }}
+
+          when:
+            - current_fs.rc == 0
+            - current_fs.stdout != fs_type
+
+############################################################
+# CREATE FILESYSTEM IF MISSING
+############################################################
+
+        - name: Create XFS filesystem
+          command: mkfs.xfs -f /dev/mapper/{{ vg_name }}--{{ lv_name }}
+          when:
+            - current_fs.rc != 0
+            - fs_type == "xfs"
+
+        - name: Create EXT4 filesystem
+          command: mkfs.ext4 -F /dev/mapper/{{ vg_name }}--{{ lv_name }}
+          when:
+            - current_fs.rc != 0
+            - fs_type == "ext4"
+############################################################
+# CREATE MOUNT DIRECTORY
+############################################################
+
+        - name: Ensure mount directory exists
+          file:
+            path: "{{ mount_point }}"
+            state: directory
+            mode: '0755'
+
+############################################################
+# MOUNT FILESYSTEM
+############################################################
+
+        - name: Mount filesystem
+          mount:
+            path: "{{ mount_point }}"
+            src: "/dev/mapper/{{ vg_name }}--{{ lv_name }}"
+            fstype: "{{ fs_type }}"
+            opts: defaults
+            state: mounted
+
+############################################################
+# GROW FILESYSTEM ONLY IF LV WAS RESIZED
+############################################################
+
+        - name: Grow XFS filesystem
+          command: xfs_growfs {{ mount_point }}
+          when:
+            - fs_type == "xfs"
+            - lvresize_result is defined
+            - lvresize_result.changed
+
+        - name: Grow EXT filesystem
+          command: resize2fs /dev/mapper/{{ vg_name }}-{{ lv_name }}
+          when:
+            - fs_type == "ext4"
+            - lvresize_result is defined
+            - lvresize_result.changed
+
+########################################
+# SUCCESS LOG
+########################################
+
+        - name: Log success
+          lineinfile:
+            path: "{{ log_file }}"
+            create: yes
+            line: |
+              SUCCESS at {{ ansible_date_time.iso8601 }}
+              VG={{ vg_name }}
+              LV={{ lv_name }}
+              Size={{ lv_size }}
+              Mount={{ mount_point }}
+
+      rescue:
+
+########################################
+# CAPTURE FAILURE DETAILS
+########################################
+
+        - name: Capture failure details
+          set_fact:
+          operation_status: "FAILED"
+          failed_task: "{{ ansible_failed_task.name }}"
+          failure_reason: >-
+            {{
+              ansible_failed_result.msg
+              | default(ansible_failed_result.stderr)
+              | default('Unknown Error')
+            }}
+        - name: Log failure
+          lineinfile:
+            path: "{{ log_file }}"
+            create: yes
+            line: |
+              FAILED at {{ ansible_date_time.iso8601 }}
+              Task={{ failed_task }}
+              Reason={{ failure_reason }}
+
+      always:
+
+########################################
+# FINAL LOG ENTRY
+########################################
+
+        - name: Log completion
+          lineinfile:
+            path: "{{ log_file }}"
+            create: yes
+            line: |
+              Completed at {{ ansible_date_time.iso8601 }}
+              Status={{ operation_status }}
+
+########################################
+# EMAIL NOTIFICATION
+########################################
+
+        - name: Send notification
+          delegate_to: localhost
+          become: false
+          community.general.mail:
+          host: smtp.gmail.com
+          to: "{{ notify_email }}"
+          sender: "anshusingh100996@gmail.com"
+          subject: "[{{ operation_status }}] LVM Management - {{ inventory_hostname }}"
+          body: |
+            LVM Automation Report
+
+            Host Name : {{ inventory_hostname }}
+            Status    : {{ operation_status }}
+
+            Volume Group: {{ vg_name }}
+            Volume Group: {{ vg_name }}
+            Logical Vol : {{ lv_name }}
+            Requested Size: {{ lv_size }}
+            Filesystem : {{ fs_type }}
+            Mount Point : {{ mount_point }}
+
+            {% if operation_status == 'SUCCESS' %}
+
+            RESULT
+            ======
+            LVM operation completed successfully.
+
+            {% else %}
+
+            FAILURE DETAILS
+            ===============
+            Failed Task:
+            {{ failed_task }}
+
+            Reason:
+            {{ failure_reason }}
+
+            {% endif %}
+
+            Timestamp:
+            {{ ansible_date_time.iso8601 }}
+
+########################################
+# MARK AAP JOB AS FAILED IF ANY ERROR OCCURRED
+########################################
+
+        - name: Mark AAP job as failed
+          fail:
+            msg: |
+              Task Failed : {{ failed_task }}
+              Reason      : {{ failure_reason }}
+          when: operation_status == "FAILED"
+
